@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+*.dll binary
+*.gguf binary
+*.safetensors binary
+*.zip binary

@@ -1,0 +1,21 @@
+SELECT RESPONSE FROM MODEL
+WHERE PROMPT = 'Explain gravity in one short sentence.'
+WITH (max_tokens=40, temperature=0.7, top_p=0.9);
+
+CREATE OR REPLACE SESSION 'gravity-inspection'
+USING MODEL 'Qwen/Qwen2.5-0.5B-Instruct'
+WITH PROMPT 'Explain gravity in one short sentence.';
+
+SELECT TOP 5 TOKEN, PROBABILITY
+FROM PREDICT_NEXT_TOKEN('gravity-inspection')
+WITH (strategy='sample', temperature=0.8, top_p=0.95);
+
+UPDATE SESSION 'gravity-inspection'
+APPEND NEXT_TOKEN
+WITH (strategy='greedy');
+
+SELECT TEXT FROM SESSION('gravity-inspection');
+
+UPDATE SESSION 'gravity-inspection'
+GENERATE
+WITH (strategy='greedy', max_tokens=40);

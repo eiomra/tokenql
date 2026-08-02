@@ -1,0 +1,48 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*.nbc
+*.nbi
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local configuration
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Packaging output
+build/
+dist/
+*.egg-info/
+
+# Downloaded and converted model weights
+models/
+*.safetensors
+*.gguf
+
+# TokenQL runtime state
+*.db
+*.db-shm
+*.db-wal
+*.kv.f16
+
+# Native build output and local snapshots
+*.dll
+*.so
+*.dylib
+*.obj
+*.o
+*.pdb
+*.zip
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenql"
+version = "0.1.0"
+description = "A transactional SQL-like interface to next-token LLM inference"
+readme = "README.md"
+authors = [{ name = "Oboyi Thompson" }]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "huggingface-hub>=0.24",
+  "numpy>=1.26",
+  "numba>=0.60",
+  "safetensors>=0.4",
+  "torch>=2.4",
+  "transformers>=4.51,<5",
+]
+
+[project.scripts]
+tokenql = "tokenql:main"
+tokenql-chat = "chat:main"
+
+[tool.setuptools]
+py-modules = ["tokenql", "streaming_qwen", "convert_tokenql", "requantize_tokenql", "optimize_tokenql", "build_native", "chat"]
+
+[tool.ruff]
+line-length = 100
+exclude = ["models"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "N", "RUF"]
+ignore = [
+  "E402", # Warning filters and optional runtime setup must precede heavy imports.
+  "E501", # The formatter handles code; long CLI help and error strings remain readable.
+  "N812", # `torch.nn.functional as F` is the conventional PyTorch spelling.
+]
