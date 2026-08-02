@@ -82,7 +82,7 @@ The main components are:
 
 2. **A manual Qwen/Qwen3-MoE decoder.** TokenQL implements RMS normalization, rotary position embeddings, grouped-query attention, causal masking, MoE routing, expert execution, sampling, and incremental decoding.
 
-3. **Bounded shared and expert caches.** Frequently reused non-expert matrices remain in a compressed shared-weight cache. Routed experts occupy a separate frequency-aware cache with a fixed capacity. Entire expert entries—gate, up, and down projections—can be fetched with one contiguous read.
+3. **Bounded shared and expert caches.** Frequently reused non-expert matrices remain in a compressed shared-weight cache. Routed experts occupy a separate frequency-aware cache with a fixed capacity. Entire expert entries, including gate, up, and down projections, can be fetched with one contiguous read.
 
 4. **A disk-backed KV cache.** The KV cache is stored as a preallocated FP16 file. Only the currently processed layer's required prefix is brought into memory. Append-only chat turns reuse their exact evaluated prefix instead of rerendering and recomputing the complete conversation.
 
@@ -92,7 +92,387 @@ The main components are:
 
 7. **Two user surfaces.** `chat.py` provides an ordinary user/assistant conversation, including Qwen's thinking on/off control. `tokenql.py` provides the technical SQL-like console for inspecting distributions, committing tokens, rewinding histories, and viewing runtime statistics.
 
-## 3. Test platform and model
+## 3. Mathematical formulation
+
+The implementation combines known transformer operations with several useful
+systems concepts: transactional token state, a bounded expert working set,
+utility-aware prefetch evaluation, and an explicit break-even condition for
+read coalescing. This section defines those concepts mathematically. It does
+not claim that the underlying transformer, quantization, or caching equations
+are new.
+
+Let $L$ be the number of transformer layers, $E$ the number of routed experts
+per MoE layer, $k$ the number selected for one token, $d$ the hidden dimension,
+and $B_q$ the Q4 block size. For the measured model,
+
+$$
+L=48, \qquad E=128, \qquad k=8, \qquad B_q=128.
+$$
+
+### 3.1 Transactional token state
+
+At generation step $t$, a TokenQL session can be represented as
+
+$$
+S_t = (P, Y_t, K_t),
+$$
+
+where $P$ is the prompt, $Y_t=(y_1,\ldots,y_t)$ is the committed token
+sequence, and $K_t$ is the corresponding KV state. The model produces logits
+
+$$
+z_t=f_\theta(P,Y_t),
+$$
+
+and the next-token distribution is
+
+$$
+p_t(v)=\frac{\exp(z_{t,v}/\tau)}
+{\sum_{u\in\mathcal V}\exp(z_{t,u}/\tau)},
+$$
+
+where $\mathcal V$ is the vocabulary and $\tau$ is the temperature. A TokenQL
+prediction query returns the $m$ most probable tokens without changing the
+session:
+
+$$
+\operatorname{SELECT}_m(S_t)
+=\operatorname{TopM}_{v\in\mathcal V}p_t(v),
+\qquad S_t'=S_t.
+$$
+
+A commit operation chooses a token by a decoding rule $\pi$, then advances the
+state:
+
+$$
+y_{t+1}\sim\pi(p_t),
+\qquad
+S_{t+1}=(P,Y_t\mathbin\Vert y_{t+1},K_{t+1}).
+$$
+
+For greedy decoding, $\pi(p_t)=\arg\max_v p_t(v)$. Rewinding to position
+$j<t$ gives
+
+$$
+\operatorname{ROLLBACK}_j(S_t)=(P,Y_j,K_j),
+$$
+
+where later tokens are removed and invalid KV state is discarded or rebuilt.
+This read-versus-commit separation is the mathematical core of the SQL-like
+interface. It makes model state explicit, but it does not reduce the cost of a
+forward pass by itself.
+
+### 3.2 Block-Q4 representation and direct GEMV
+
+For row $r$ and quantization block $b$, TokenQL computes the scale
+
+$$
+s_{r,b}=\frac{\max_j |W_{r,b,j}|}{7},
+$$
+
+with $s_{r,b}=1$ for an all-zero block, then stores
+
+$$
+q_{r,b,j}
+=\operatorname{clip}\left(
+\operatorname{round}\left(\frac{W_{r,b,j}}{s_{r,b}}\right),
+-7,7
+\right).
+$$
+
+Two signed Q4 values occupy one byte. Ignoring padding and metadata, an
+$m\times n$ matrix requires approximately
+
+$$
+M_{Q4}(m,n)
+=\frac{mn}{2}
++4m\left\lceil\frac{n}{B_q}\right\rceil
+\quad\text{bytes},
+$$
+
+where the second term stores one FP32 scale per row block. Relative to FP16,
+the ideal compression ratio is
+
+$$
+C_{Q4}
+=\frac{2mn}{M_{Q4}(m,n)}.
+$$
+
+For large aligned matrices with $B_q=128$, this approaches
+
+$$
+C_{Q4}\approx\frac{2}{0.5+4/128}\approx3.76.
+$$
+
+The native kernel does not construct a full dequantized matrix. It evaluates
+each output row directly:
+
+$$
+y_r
+=\sum_b s_{r,b}
+\sum_{j=0}^{B_q-1}q_{r,b,j}x_{bB_q+j}.
+$$
+
+This equation explains why the runtime can retain compressed matrices in its
+managed cache while using FP32 activations at the kernel boundary.
+
+### 3.3 Sparse expert routing
+
+For hidden state $h_l$ at layer $l$, the router produces scores
+
+$$
+r_l=W_{r,l}h_l.
+$$
+
+The selected expert set is
+
+$$
+\mathcal T_l(h_l)=\operatorname{TopK}(r_l,k),
+$$
+
+with normalized routing weights
+
+$$
+\alpha_{l,e}
+=\frac{\exp(r_{l,e})}
+{\sum_{j\in\mathcal T_l(h_l)}\exp(r_{l,j})},
+\qquad e\in\mathcal T_l(h_l).
+$$
+
+The routed MoE output is
+
+$$
+\operatorname{MoE}_l(h_l)
+=\sum_{e\in\mathcal T_l(h_l)}\alpha_{l,e}
+W^{\mathrm{down}}_{l,e}
+\left[
+\operatorname{SiLU}\left(W^{\mathrm{gate}}_{l,e}h_l\right)
+\odot
+W^{\mathrm{up}}_{l,e}h_l
+\right].
+$$
+
+Only
+
+$$
+\frac{k}{E}=\frac{8}{128}=6.25\%
+$$
+
+of the routed experts are selected for one token in one layer. Shared weights
+still participate, so the model-card ratio of activated to total parameters is
+
+$$
+\frac{3.3\ \text{B}}{30.5\ \text{B}}\approx10.82\%.
+$$
+
+This distinction is important. Expert sparsity reduces the routed working set,
+but it does not turn the complete model into an 8 GB dense model.
+
+### 3.4 Managed memory and SSD traffic
+
+TokenQL enforces the approximate managed-memory constraint
+
+$$
+M_{\mathrm{shared}}
++M_{\mathrm{experts}}
++M_{\mathrm{buffers}}
++M_{\mathrm{resident}}
+\le B_{\mathrm{managed}}.
+$$
+
+Total process memory is larger:
+
+$$
+M_{\mathrm{process}}
+=M_{\mathrm{managed}}
++M_{\mathrm{Python}}
++M_{\mathrm{libraries}}
++M_{\mathrm{activations}}
++M_{\mathrm{other}}.
+$$
+
+Let $\mathcal C_l$ be the cached expert set for layer $l$, let
+$\mathcal T_{l,t}$ be the experts routed for token $t$, and let $s_{l,e}$ be
+the packed size of expert $e$. The exact expert bytes missing from the cache
+are
+
+$$
+D_{\mathrm{miss},t}
+=\sum_{l=1}^{L}\sum_{e\in\mathcal T_{l,t}}
+\mathbf 1[e\notin\mathcal C_l]s_{l,e}.
+$$
+
+The observed cache hit rate is
+
+$$
+H=\frac{N_{\mathrm{hit}}}
+{N_{\mathrm{hit}}+N_{\mathrm{miss}}}.
+$$
+
+If SSD bandwidth is $\beta$ bytes per second, average per-read overhead is
+$\lambda$, and $n_{\mathrm{read}}$ reads are issued, a first-order serial
+service-cost model before overlap is
+
+$$
+T_{\mathrm{I/O}}
+\gtrsim\frac{D_{\mathrm{miss}}}{\beta}
++n_{\mathrm{read}}\lambda.
+$$
+
+This exposes the two different optimization targets: reducing bytes and
+reducing read operations. An optimization that improves only one can still be
+slower overall.
+
+### 3.5 Disk-backed KV state and append-only turns
+
+For FP16 keys and values, a simplified KV-capacity equation is
+
+$$
+M_{KV}=2LTn_{kv}d_hb,
+$$
+
+where the leading factor of two represents keys and values, $T$ is context
+length, $n_{kv}$ is the number of KV heads, $d_h$ is head dimension, and
+$b=2$ bytes for FP16. TokenQL stores this capacity in a disk-backed map and
+loads the required layer prefix during execution.
+
+If a conversation already has $T_h$ evaluated tokens and the new turn adds
+$\Delta T$ tokens, preserving the exact prefix changes ideal prefill work from
+being proportional to $T_h+\Delta T$ to being proportional to $\Delta T$.
+The ideal fraction of token passes avoided is therefore
+
+$$
+R_{\mathrm{reuse}}
+=1-\frac{\Delta T}{T_h+\Delta T}
+=\frac{T_h}{T_h+\Delta T}.
+$$
+
+Actual savings vary because MoE routes, cache residency, and attention length
+also affect cost.
+
+### 3.6 Request latency and throughput
+
+For a response containing $N$ generated tokens, the first token comes from the
+prefill logits and the remaining $N-1$ tokens require decode passes. A useful
+latency decomposition is
+
+$$
+T_{\mathrm{request}}
+=T_{\mathrm{tokenize}}
++T_{\mathrm{prefill}}
++\sum_{i=1}^{N-1}T_{\mathrm{decode},i}
++T_{\mathrm{emit}}.
+$$
+
+Time to first token is approximately
+
+$$
+T_{\mathrm{TTFT}}
+\approx T_{\mathrm{tokenize}}
++T_{\mathrm{prefill}}
++T_{\mathrm{sample},1}.
+$$
+
+End-to-end and decode-only rates must therefore be reported separately:
+
+$$
+R_{\mathrm{end}}=\frac{N}{T_{\mathrm{request}}},
+\qquad
+R_{\mathrm{decode}}
+=\frac{N-1}{\sum_{i=1}^{N-1}T_{\mathrm{decode},i}}.
+$$
+
+For one decode pass, asynchronous loading gives the approximate model
+
+$$
+T_{\mathrm{decode}}
+\approx T_{\mathrm{compute}}
++T_{\mathrm{orchestration}}
++\max(0,T_{\mathrm{I/O}}-T_{\mathrm{overlap}}).
+$$
+
+The last term is unhidden I/O. This is why faster matrix kernels can initially
+make prefetch statistics look worse: less compute time remains available to
+hide the same read.
+
+### 3.7 Prediction utility, not prediction accuracy alone
+
+For speculative expert prediction, ordinary precision is
+
+$$
+P_{\mathrm{route}}
+=\frac{N_{\mathrm{correct}}}{N_{\mathrm{predicted}}}.
+$$
+
+The system-level metric is stricter:
+
+$$
+U_{\mathrm{I/O}}
+=\frac{N_{\mathrm{useful\ uncached\ predictions}}}
+{N_{\mathrm{predicted}}}.
+$$
+
+The stability predictor produced only five useful reads from 834 candidates:
+
+$$
+U_{\mathrm{I/O}}=\frac{5}{834}\approx0.60\%.
+$$
+
+Its route precision could be high while its I/O utility remained low because
+stable experts were usually already cached. A speculative policy is beneficial
+only when
+
+$$
+T_{\mathrm{saved}}
+>T_{\mathrm{wrong\ reads}}
++T_{\mathrm{contention}}
++T_{\mathrm{eviction}}.
+$$
+
+This useful-prediction criterion is more informative than route accuracy by
+itself.
+
+### 3.8 Read coalescing and its break-even condition
+
+For exact expert ranges $i=1,\ldots,n$, define
+
+$$
+D_{\mathrm{exact}}=\sum_{i=1}^{n}s_i.
+$$
+
+If those ranges are merged into $g$ larger reads with byte spans
+$[a_j,b_j)$, then
+
+$$
+D_{\mathrm{coal}}=\sum_{j=1}^{g}(b_j-a_j),
+\qquad
+A_{\mathrm{bytes}}=\frac{D_{\mathrm{coal}}}{D_{\mathrm{exact}}}\ge1.
+$$
+
+The read-count reduction is
+
+$$
+R_{\mathrm{calls}}=1-\frac{g}{n}.
+$$
+
+With per-call overhead $\lambda$, coalescing has a chance to win only if
+
+$$
+(n-g)\lambda
+>\frac{D_{\mathrm{coal}}-D_{\mathrm{exact}}}{\beta}
++T_{\mathrm{copy}}
++T_{\mathrm{contention}}.
+$$
+
+The measured experiments failed this inequality. Persistent handles had
+already reduced $\lambda$, so the extra bytes, copies, and contention were more
+expensive than the calls that coalescing removed.
+
+These definitions formalize what became the central design lesson: feasibility
+depends on a bounded working set, but speed depends on minimizing the unhidden
+movement and orchestration cost of that working set.
+
+## 4. Test platform and model
 
 | Component | Configuration |
 |---|---|
@@ -112,7 +492,7 @@ The main components are:
 
 The phrase **8 GiB managed weight budget** needs careful interpretation. It covers TokenQL's compressed shared matrices, expert-cache capacity, resident vectors, and managed weight buffers. It does **not** include the Python interpreter, PyTorch and tokenizer libraries, transient activations, the operating system's filesystem cache, or all process memory. The complete 30.05 GiB converted model remains on SSD. Therefore, the result should not be described as “a 30B model using only 8 GB of total RAM.”
 
-## 4. The performance journey
+## 5. The performance journey
 
 The useful result was not produced by one idea. It came from repeatedly measuring the full pipeline and removing its current bottleneck.
 
@@ -126,11 +506,11 @@ The useful result was not produced by one idea. It came from repeatedly measurin
 | Persistent per-thread pack handles | 0.99–1.01 decode tok/s at 4 GiB | Reusing file handles and reading into existing buffers crossed the 1 tok/s target. |
 | 8 GiB budget, eight I/O workers | 1.15–1.54 decode tok/s in a representative session | A larger expert cache improved warm-turn hit rate and reduced SSD traffic. |
 
-Two lessons stand out. First, optimization changed the identity of the bottleneck several times: generic matrix math, Python orchestration, repeated metadata work, file opening, and finally cache misses and prefill. Second, low-level but unglamorous changes—caching resolved paths and retaining handles—produced some of the largest practical gains.
+Two lessons stand out. First, optimization changed the identity of the bottleneck several times: generic matrix math, Python orchestration, repeated metadata work, file opening, and finally cache misses and prefill. Second, low-level but unglamorous changes, especially caching resolved paths and retaining handles, produced some of the largest practical gains.
 
 The Q4 representation also matters. Storing the 30B checkpoint in approximately 30 GiB is larger than the physical RAM but small enough for the laptop's SSD. Q4 reduces traffic relative to Q8, while the native kernel avoids materializing expanded copies of complete matrices.
 
-## 5. Current end-to-end result
+## 6. Current end-to-end result
 
 The following command produced the representative session reported here:
 
@@ -146,9 +526,31 @@ py -3.12 .\chat.py --backend streamed --model-dir .\models\qwen3-30b-a3b-tokenql
 
 The trend is internally consistent: the expert cache warms from one turn to the next, decode cache hit rate rises, logical reads fall, and throughput improves. It is also important not to hide the cold-start experience behind the best number. The first short greeting required 21.73 seconds overall even though its decode phase exceeded one token per second.
 
+Across the first and third turns, logical weight reads fell by
+
+$$
+1-\frac{3.41}{6.64}\approx48.6\%,
+$$
+
+while the decode cache hit rate increased by
+
+$$
+91.9\%-83.4\%=8.5\ \text{percentage points}.
+$$
+
+Using 0.03 tok/s as an early reference, the measured warm peak corresponds to
+
+$$
+S_{\mathrm{peak}}=\frac{1.54}{0.03}\approx51.3\times.
+$$
+
+This ratio summarizes the engineering progression, but it is not a controlled
+runtime comparison because the implementation and cache conditions changed
+between stages.
+
 These figures are observational results from one machine and a short conversational run. They are not yet a statistically rigorous benchmark. Some development runs used a fixed seed of 42 for controlled comparisons, but the table above should be treated as a representative interactive trace, not a mean with confidence intervals.
 
-## 6. Why time to first token remains high
+## 7. Why time to first token remains high
 
 Autoregressive decode processes one new token at a time, but prefill must evaluate every prompt token before the first output token is available. For MoE inference, those prompt tokens may collectively route to many experts in every layer. On a cold start, few of those experts are resident, so prefill has to read a broad working set from SSD.
 
@@ -156,17 +558,17 @@ Later chat turns are faster for two reasons. The exact previously evaluated toke
 
 Increasing the managed budget from 4 GiB to 8 GiB substantially improved warm throughput, but it did not reliably eliminate cold prefill because an empty larger cache is still empty. The next latency target is therefore prompt processing, not merely decode GEMV speed. Potential directions include more effective layer-major batched prefill, storage-aware expert layout learned from real routing traces, and safe cache prewarming.
 
-## 7. Experiments that did not work
+## 8. Experiments that did not work
 
 Negative results were among the most useful parts of this project because they prevented attractive but ineffective mechanisms from becoming defaults.
 
-### 7.1 Previous-token expert prediction
+### 8.1 Previous-token expert prediction
 
 An initial predictor assumed that the previous token's expert routes would be useful for the next token. It achieved only 43.4% route accuracy. More importantly, it raised warm-turn weight traffic by approximately 45–52% and slowed execution. Incorrect guesses competed with exact reads for SSD bandwidth and cache capacity.
 
 A conservative stability predictor was then built. It selected at most two experts that appeared in both of the two previous route sets and launched them through a separate speculative queue. Its top-two precision reached approximately 81.5% at a two-token distance and 84.6–87.4% at a three-token distance. Nevertheless, only five of 834 candidates caused useful I/O: predictable experts were usually already cached. In one comparison, decode was 0.79 tok/s with prediction versus 0.85 tok/s without it. High prediction precision did not translate into high system value, so expert prediction remains disabled by default.
 
-### 7.2 Coalescing nearby expert reads
+### 8.2 Coalescing nearby expert reads
 
 Because all experts for one layer are stored in a contiguous pack file, combining nearby ranges seemed likely to reduce read calls. A layout profiler showed the tradeoff:
 
@@ -178,7 +580,7 @@ Measured performance contradicted the syscall-count intuition. Adjacent-only coa
 
 Persistent file handles had already made individual reads relatively cheap. Coalescing added buffer copies and scheduling work, while broader spans consumed SSD bandwidth with unused bytes. The code remains available as an experimental flag, but coalescing is off by default.
 
-### 7.3 More threads are not automatically better
+### 8.3 More threads are not automatically better
 
 Four compute threads outperformed three on this four-core/eight-thread CPU, but
 the I/O-worker results did not have one universal winner. At the 8 GiB budget,
@@ -188,7 +590,7 @@ workers produced marginally higher warm decode throughput (1.22–1.25 versus
 seconds). Sixteen workers regressed cold prefill because of contention. Queue
 depth is hardware-specific and should be measured rather than assumed.
 
-## 8. Relationship to prior work
+## 9. Relationship to prior work
 
 TokenQL should be positioned as an independent engineering implementation, not as the invention of model offloading or quantized CPU inference.
 
@@ -206,7 +608,7 @@ TokenQL's contribution is the measured integration of several ideas for one cons
 
 This combination is useful and reproducible, but no priority or “first” claim is made. A fair comparison with llama.cpp or Ollama on the same laptop, model quantization, context, output length, and sampling settings is still required before making comparative performance claims.
 
-## 9. Reproduction
+## 10. Reproduction
 
 Clone the public source repository and install its Python dependencies:
 
@@ -240,9 +642,35 @@ For a proper benchmark, the process should be repeated several times in both col
 - CPU utilization, SSD model and throughput, energy use, and thermal state; and
 - mean, median, standard deviation, and sample count.
 
+For $n$ repeated trials with measured rate $R_i$, report the sample mean and
+sample standard deviation:
+
+$$
+\bar R=\frac{1}{n}\sum_{i=1}^{n}R_i,
+\qquad
+s_R=\sqrt{\frac{1}{n-1}\sum_{i=1}^{n}(R_i-\bar R)^2}.
+$$
+
+When the sampling assumptions are reasonable, a 95% confidence interval can
+be reported as
+
+$$
+\bar R\pm t_{0.975,n-1}\frac{s_R}{\sqrt n}.
+$$
+
+Energy measurements should distinguish power from efficiency. If wall power is
+$P(t)$, request energy and output efficiency are
+
+$$
+E_{\mathrm{request}}=\int_0^{T_{\mathrm{request}}}P(t)\,dt,
+\qquad
+\eta_{\mathrm{token}}=\frac{N}{E_{\mathrm{request}}}
+\quad\text{tokens/joule}.
+$$
+
 The current automated suite contains 14 passing tests, including small-model numerical checks, incremental KV-cache decoding, and forced expert-cache eviction. A native complete-model comparison against the Numba path produced the same argmax, cosine similarity near 1.0, and a maximum reported logit error of approximately 2.19×10⁻⁵. Those checks validate implementation consistency; they are not a full model-quality evaluation against the original unquantized checkpoint.
 
-## 10. Limitations and next work
+## 11. Limitations and next work
 
 The runtime is research-grade. Its present limitations include:
 
@@ -257,11 +685,11 @@ The runtime is research-grade. Its present limitations include:
 
 The next practical work is to build an automated benchmark harness, record cold and warm trials, compare against llama.cpp/Ollama, and profile prefill at layer and expert granularity. If the project is submitted as an academic systems paper rather than a technical article, the evaluation should also include multiple SSDs and CPUs, model sizes, context lengths, batch sizes, ablation studies, energy measurements, and response-quality tests.
 
-## 11. Conclusion
+## 12. Conclusion
 
 TokenQL demonstrates that a laptop does not have to hold an entire 30.05 GiB Q4 MoE checkpoint in application-managed RAM to execute it. By keeping model packs on SSD, caching recurring compressed experts, persisting KV state, using asynchronous exact reads, and executing packed weights with native CPU kernels, the runtime moved from approximately 0.03 tok/s to sustained decode above 1 tok/s, with a measured warm-turn peak of 1.54 tok/s.
 
-The most important conclusion is not the peak number. The project shows where bounded-memory inference actually spends time and how easily a plausible optimization can fail. Prediction accuracy was not enough when predicted experts were already cached. Fewer I/O calls were not enough when coalescing increased copying and byte traffic. Conversely, removing repeated path resolution and file reopening—small orchestration details—made decisive improvements.
+The most important conclusion is not the peak number. The project shows where bounded-memory inference actually spends time and how easily a plausible optimization can fail. Prediction accuracy was not enough when predicted experts were already cached. Fewer I/O calls were not enough when coalescing increased copying and byte traffic. Conversely, removing repeated path resolution and file reopening, both small orchestration details, made decisive improvements.
 
 This is not yet a replacement for mature inference engines, and it does not make SSD equivalent to RAM. It is a functioning, inspectable foundation for studying how sparse language models can trade memory capacity for storage traffic on ordinary hardware.
 
