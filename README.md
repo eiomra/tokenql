@@ -9,6 +9,9 @@ DOI or publication identifier. No software license has been selected yet, so
 public access should not be interpreted as permission to redistribute or
 incorporate the code into another project.
 
+The longer implementation history, benchmark discussion, negative results, and
+limitations are documented in the [unpublished technical draft](ARTICLE.md).
+
 ## Two interfaces
 
 ### 1. Normal user chat
