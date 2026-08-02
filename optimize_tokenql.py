@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 """Prepack TokenQL Q4 matrices for PyTorch's native AVX CPU kernel.
 
 The portable TokenQL Q4 layout remains untouched. This command creates

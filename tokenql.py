@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 """TokenQL: a small transactional query layer over autoregressive LLM inference."""
 
 from __future__ import annotations

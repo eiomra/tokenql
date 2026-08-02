@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 """Convert dense Qwen2/Qwen2.5 or sparse Qwen3-MoE weights to TokenQL.
 
 The converter never materializes the whole checkpoint. Two-dimensional weight

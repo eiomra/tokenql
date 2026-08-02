@@ -20,10 +20,9 @@ The result is not a claim that a complete 30B model fits in 8 GB, nor that SSD p
 
 **Code availability:** The implementation is publicly available at
 [github.com/eiomra/tokenql](https://github.com/eiomra/tokenql). This manuscript
-has not been formally published and has no DOI or publication identifier. No
-software license has been selected yet, so public access to the repository
-should not be interpreted as permission to redistribute or incorporate the
-code into another project.
+has not been formally published and has no DOI or publication identifier. The
+source code is released under the
+[MIT License](https://github.com/eiomra/tokenql/blob/main/LICENSE).
 
 ## 1. Motivation: from SQL-style control to bounded-memory inference
 

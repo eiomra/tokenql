@@ -5,9 +5,8 @@ TokenQL is a SQL-like interface and a custom, bounded-memory Qwen inference runt
 The source code is publicly available in this repository at
 [github.com/eiomra/tokenql](https://github.com/eiomra/tokenql). TokenQL is an
 experimental software project, not a peer-reviewed publication, and it has no
-DOI or publication identifier. No software license has been selected yet, so
-public access should not be interpreted as permission to redistribute or
-incorporate the code into another project.
+DOI or publication identifier. The source code is released under the
+[MIT License](LICENSE).
 
 The longer implementation history, benchmark discussion, negative results, and
 limitations are documented in the [unpublished technical draft](ARTICLE.md).

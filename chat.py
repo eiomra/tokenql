@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 """Plain user/assistant interface for TokenQL's inference backends."""
 
 from __future__ import annotations

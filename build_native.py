@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 """Build TokenQL's optional AVX-512 VNNI Q4 kernel on Windows."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 """Disk-first TokenQL Q8 to block-Q4 converter using bounded NumPy buffers."""
 
 from __future__ import annotations

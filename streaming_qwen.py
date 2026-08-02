@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 """Bounded-memory dense Qwen and expert-paged Qwen3-MoE inference.
 
 This module implements the decoder directly. It does not instantiate a Hugging
