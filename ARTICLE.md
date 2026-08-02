@@ -538,16 +538,6 @@ $$
 91.9\%-83.4\%=8.5\ \text{percentage points}.
 $$
 
-Using 0.03 tok/s as an early reference, the measured warm peak corresponds to
-
-$$
-S_{\mathrm{peak}}=\frac{1.54}{0.03}\approx51.3\times.
-$$
-
-This ratio summarizes the engineering progression, but it is not a controlled
-runtime comparison because the implementation and cache conditions changed
-between stages.
-
 These figures are observational results from one machine and a short conversational run. They are not yet a statistically rigorous benchmark. Some development runs used a fixed seed of 42 for controlled comparisons, but the table above should be treated as a representative interactive trace, not a mean with confidence intervals.
 
 ## 7. Why time to first token remains high
